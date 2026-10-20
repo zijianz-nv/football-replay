@@ -3,12 +3,15 @@
   'use strict';
   const bridgeURL = new URL(document.currentScript.src);
   const origin = bridgeURL.origin;
-  const workerURL = new URL('gate-sw.js', bridgeURL).href;
+  const workerScript = new URL('gate-sw.js', bridgeURL);
+  if(bridgeURL.searchParams.has('v'))workerScript.searchParams.set('v',bridgeURL.searchParams.get('v'));
+  const workerURL = workerScript.href;
   if (window.parent === window) return;
   let key = null, manifest = null, release = null, issuedAt = 0;
   let installing = null, expiryTimer = null, locked = false;
   let rendered = false;
-  const tellParent = (type, message) => window.parent.postMessage({type, ...(message ? {message} : {})}, origin);
+  const tellParent = (type, message, code) => window.parent.postMessage({type, ...(message ? {message} : {}), ...(code ? {code} : {})}, origin);
+  const failure = code => Object.assign(new Error(code), {code});
   function ownController() {
     return new Promise((resolve, reject) => {
       const container = navigator.serviceWorker;
@@ -17,7 +20,7 @@
         const worker = container.controller;
         if (worker?.scriptURL === workerURL) { cleanup(); resolve(worker); }
       };
-      const timer = setTimeout(() => { cleanup(); reject(new Error('请刷新复盘入口后重新解锁。')); }, 15000);
+      const timer = setTimeout(() => { cleanup(); reject(failure('CONTROLLER_TIMEOUT')); }, 30000);
       container.addEventListener('controllerchange', check);check();
     });
   }
@@ -30,13 +33,14 @@
     }
     return new Promise((resolve, reject) => {
     const channel = new MessageChannel();
-    const timer = setTimeout(() => { channel.port1.close(); reject(new Error('解锁连接超时，请重新输入口令。')); }, 10000);
+    const timer = setTimeout(() => { channel.port1.close(); reject(failure('SESSION_TIMEOUT')); }, 30000);
     channel.port1.onmessage = event => {
       clearTimeout(timer); channel.port1.close();
       if (event.data?.ok) resolve(event.data);
-      else reject(new Error(event.data?.error || '无法解锁复盘。'));
+      else reject(failure('SESSION_INVALID'));
     };
-    worker.postMessage({type, ...fields}, [channel.port2]);
+    try {worker.postMessage({type, ...fields}, [channel.port2]);}
+    catch(error) {clearTimeout(timer);channel.port1.close();reject(failure(error.name==='DataCloneError'?'SESSION_INVALID':'CONTROLLER_TIMEOUT'));}
     });
   };
   function forget() {
@@ -57,7 +61,13 @@
         if (!locked) { tellParent('REPLAY_UNLOCKED'); return true; }
         return false;
       } catch (error) {
-        if (!locked) { forget(); tellParent('REPLAY_ERROR', error.message); }
+        if (!locked) {
+          if (error.code==='SESSION_TIMEOUT' || error.code==='CONTROLLER_TIMEOUT') {
+            // A delayed ACK does not invalidate the key. Keep its original expiry;
+            // retry establishes authority only for this document's native client.
+            tellParent('REPLAY_RETRYABLE_ERROR', null, error.code);
+          } else {forget();tellParent('REPLAY_ERROR', null, 'SESSION_INVALID');}
+        }
         return false;
       } finally { installing = null; }
     })();
@@ -98,7 +108,7 @@
       if (key || installing) return;
       const incoming = event.data;
       if (!incoming.key || incoming.key.extractable !== false || incoming.key.algorithm?.name !== 'AES-GCM') {
-        tellParent('REPLAY_ERROR', '口令会话无效，请重新解锁。'); return;
+        tellParent('REPLAY_ERROR', null, 'SESSION_INVALID'); return;
       }
       key = incoming.key; manifest = incoming.manifest; release = incoming.release;
       issuedAt = Number.isSafeInteger(incoming.issuedAt) ? incoming.issuedAt : Date.now(); locked = false;
@@ -115,7 +125,7 @@
     if (event.data?.type === 'REPLAY_NEED_KEY') install();
     else if (event.data?.type === 'REPLAY_SESSION_EXPIRED') { forget(); tellParent('REPLAY_LOCKED'); }
     else if (event.data?.type === 'REPLAY_RESOURCE_ERROR') tellParent('REPLAY_RESOURCE_ERROR');
-    else if (event.data?.type === 'REPLAY_CONTENT_ERROR') tellParent('REPLAY_ERROR', '复盘文件校验失败，请刷新后重试。');
+    else if (event.data?.type === 'REPLAY_CONTENT_ERROR') tellParent('REPLAY_ERROR', null, 'CONTENT_INVALID');
   });
   navigator.serviceWorker.addEventListener('controllerchange', () => { if (key && !locked) install(); });
   window.addEventListener('pagehide', () => { forget(); navigator.serviceWorker.controller?.postMessage({type: 'REPLAY_REVOKE_SESSION'}); });

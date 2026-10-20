@@ -1,1 +1,1 @@
-{"format":"football-sealed-v1","release":"1c0a2ca249a36b935cc78de81d12fd63","kdf":{"salt":"1Iej+htgvi+0wQlKgDXKHg==","iterations":600000,"hash":"SHA-256"},"manifest":{"iv":"+4aS1gAMkPVRA4JH","url":"manifest.enc"}}
+{"format":"football-sealed-v1","release":"1c0a2ca249a36b935cc78de81d12fd63","kdf":{"salt":"1Iej+htgvi+0wQlKgDXKHg==","iterations":600000,"hash":"SHA-256"},"manifest":{"iv":"yik9b45n9f7lPyMq","url":"manifest.enc"}}

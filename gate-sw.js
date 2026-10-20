@@ -44,8 +44,15 @@ function validateManifest(manifest, release) {
     const chunks = file.chunks.map(chunk => {
       if (!chunk || typeof chunk.url !== 'string' || !/^payload\/[A-Za-z0-9_-]+\.bin$/.test(chunk.url) ||
           chunk.offset !== offset || !integer(chunk.length) || chunk.length < 1 || chunk.length > MAX_CHUNK_BYTES) throw new Error('Invalid chunk');
+      const encoding = chunk.encoding ?? 'identity';
+      const encodedLength = chunk.encodedLength ?? chunk.length;
+      if (!['identity', 'gzip'].includes(encoding) || !integer(encodedLength) ||
+          encodedLength < 1 || encodedLength > MAX_CHUNK_BYTES ||
+          (encoding === 'identity' && encodedLength !== chunk.length) ||
+          (encoding === 'gzip' && file.encoding !== 'identity')) throw new Error('Invalid chunk encoding');
       offset += chunk.length;
-      return {url: new URL(chunk.url, SCOPE).href, iv: decode64(chunk.iv, 12), offset: chunk.offset, length: chunk.length};
+      return {url: new URL(chunk.url, SCOPE).href, iv: decode64(chunk.iv, 12), offset: chunk.offset,
+        length: chunk.length, encoding, encodedLength};
     });
     if (offset !== file.encodedSize) throw new Error('Incomplete file');
     files.set(path, {mime: file.mime, size: file.size, encodedSize: file.encodedSize, encoding: file.encoding, chunks});
@@ -237,6 +244,26 @@ async function readCipher(url, expected, signal) {
     }
   }
 }
+async function decodeChunk(encoded, chunk, signal) {
+  if (encoded.byteLength !== chunk.encodedLength) throw new Error('Invalid encoded chunk length');
+  if (chunk.encoding === 'identity') return encoded;
+  // Authentication happens before decompression. Never allocate or return an
+  // unbounded inflated buffer; range offsets still address the original MP4.
+  const reader = new Blob([encoded]).stream().pipeThrough(new DecompressionStream('gzip')).getReader();
+  const plain = new Uint8Array(chunk.length);
+  let offset = 0;
+  try {
+    for (;;) {
+      if (signal.aborted) throw new Error('Session locked');
+      const {value, done} = await reader.read();
+      if (done) break;
+      if (offset + value.byteLength > plain.length) throw new Error('Invalid decompressed chunk length');
+      plain.set(value, offset); offset += value.byteLength;
+    }
+    if (offset !== plain.length) throw new Error('Incomplete decompressed chunk');
+    return plain;
+  } finally { await reader.cancel().catch(() => {}); }
+}
 function encryptedStream(session, clientId, path, file, start, end) {
   const aborter = new AbortController();
   session.aborters.add(aborter);
@@ -251,9 +278,11 @@ function encryptedStream(session, clientId, path, file, start, end) {
           finish(); controller.close(); return;
         }
         const chunk = file.chunks[index];
-        const cipher = await readCipher(chunk.url, chunk.length + 16, aborter.signal);
-        const plain = new Uint8Array(await crypto.subtle.decrypt({name: 'AES-GCM', iv: chunk.iv,
+        const cipher = await readCipher(chunk.url, chunk.encodedLength + 16, aborter.signal);
+        const encoded = new Uint8Array(await crypto.subtle.decrypt({name: 'AES-GCM', iv: chunk.iv,
           additionalData: encoder.encode(`${FORMAT}\n${session.release}\n${path}\n${index}`), tagLength: 128}, session.key, cipher));
+        if (!isLive(session) || aborter.signal.aborted) throw new Error('Session locked');
+        const plain = await decodeChunk(encoded, chunk, aborter.signal);
         if (!isLive(session) || aborter.signal.aborted) throw new Error('Session locked');
         if (plain.byteLength !== chunk.length) throw new Error('Invalid decrypted length');
         const from = Math.max(0, start - chunk.offset);
