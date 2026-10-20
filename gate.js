@@ -6,8 +6,8 @@
   const gate = document.querySelector('#gate'), viewer = document.querySelector('#viewer');
   const loadNotice = document.querySelector('#load-notice');
   let active = null, iframe = null, attempt = 0;
-  let restoreTimer = null, entryTimer = null;
-  const shellVersion = '20261020-mobile4';
+  let restoreTimer = null, entryTimer = null, viewReady = false;
+  const shellVersion = '20261020-mobile5';
   const closingFrames = new Map();
   const bytes = value => Uint8Array.from(atob(value), c => c.charCodeAt(0));
   const aad = text => new TextEncoder().encode(text);
@@ -28,6 +28,16 @@
     loadNotice.querySelector('span').textContent = text;
     loadNotice.hidden = false;
   }
+  const phaseText = code => ({
+    controller:'正在连接解锁服务…（M5-C）',
+    received:'解锁请求已收到，正在建立会话…（M5-I）',
+    client_lookup:'正在确认当前页面…（M5-L）',
+    key_import:'正在处理兼容连接…（M5-K）',
+    installed:'连接已建立，正在加载复盘…（M5-R）',
+    status_check:'正在核验连接状态…（M5-P）',
+    byte_retry:'正在尝试兼容连接…（M5-B）',
+    render:'连接已建立，正在加载复盘…（M5-R）'
+  }[code] || '正在打开复盘…');
   async function fetchBytes(path, code, limit) {
     // Retry transport failures only. A failed authentication is never retried as a network error.
     for (let trial=0;trial<3;trial++) {
@@ -98,6 +108,7 @@
     closingFrames.delete(frame);frame.remove();
   }
   function retireFrame() {
+    viewReady=false;
     clearInterval(restoreTimer);restoreTimer=null;
     clearTimeout(entryTimer);entryTimer=null;
     const closing=iframe;iframe=null;
@@ -121,7 +132,7 @@
     frame.src=localURL(`gate-frame.html?v=${shellVersion}`).href;
     document.querySelector('#frame-host').append(frame);
     gate.hidden=true;viewer.hidden=false;button.disabled=false;
-    if(loadNotice)loadNotice.hidden=true;
+    showLoadNotice(phaseText('controller'));
     entryTimer=setTimeout(()=>{
       if(iframe===frame)showLoadNotice('复盘仍在加载，可点击重试，无需重复输入口令。（S03-W）');
     },35000);
@@ -156,18 +167,29 @@
         clearTimeout(entryTimer);entryTimer=null;
         showLoadNotice('页面版本未更新，请刷新后重新打开。（S05）');return;
       }
-      iframe.contentWindow.postMessage({type:'REPLAY_UNLOCK',key:active.key,manifest:active.manifest,
+      iframe.contentWindow.postMessage({type:'REPLAY_UNLOCK',key:active.key,keyEnvelope:active.keyEnvelope,manifest:active.manifest,
         release:active.manifest.release,issuedAt:active.issuedAt,html:active.html},location.origin);
     } else if(event.data?.type==='REPLAY_LOCKED') lock('访问已结束，请重新输入口令。');
-    else if(event.data?.type==='REPLAY_VIEW_READY') {clearTimeout(entryTimer);entryTimer=null;if(loadNotice)loadNotice.hidden=true;}
+    else if(event.data?.type==='REPLAY_VIEW_READY') {viewReady=true;clearTimeout(entryTimer);entryTimer=null;if(loadNotice)loadNotice.hidden=true;}
+    else if(event.data?.type==='REPLAY_UNLOCKED') {
+      clearTimeout(entryTimer);
+      entryTimer=null;
+      // Reconnecting an already-rendered view does not require a second render.
+      if(viewReady){if(loadNotice)loadNotice.hidden=true;}
+      else {
+        showLoadNotice(phaseText('render'));
+        entryTimer=setTimeout(()=>showLoadNotice('连接已建立，但复盘内容仍未载入，可重试加载。（N05）'),30000);
+      }
+    }
+    else if(event.data?.type==='REPLAY_PHASE') showLoadNotice(phaseText(event.data.code));
     else if(event.data?.type==='REPLAY_RESOURCE_ERROR') showLoadNotice('部分内容加载失败，可重试并回到当前播放位置。（N04）');
     else if(event.data?.type==='REPLAY_RECONNECTING') {
       clearTimeout(entryTimer);entryTimer=null;
-      showLoadNotice('正在重新连接解锁服务，请稍候…');
+      showLoadNotice(phaseText(event.data.code==='KEY_TRANSFER_FAILED' || event.data.code==='SESSION_TIMEOUT'?'byte_retry':'controller'));
     }
     else if(event.data?.type==='REPLAY_RETRYABLE_ERROR') {
       clearTimeout(entryTimer);entryTimer=null;
-      const code=event.data.code==='SESSION_TIMEOUT'?'S03-A':'S03-C';
+      const code=({SESSION_TIMEOUT:'S03-A',KEY_TRANSFER_FAILED:'S03-K',CLIENT_LOOKUP_TIMEOUT:'S03-L',CLIENT_UNAVAILABLE:'S03-L'})[event.data.code]||'S03-C';
       showLoadNotice(`解锁连接暂时中断，点击重试加载，无需重复输入口令。（${code}）`);
     }
     else if(event.data?.type==='REPLAY_ERROR') lock(errorText(event.data.code));
@@ -192,8 +214,18 @@
       try {manifest=JSON.parse(new TextDecoder().decode(plain));}
       finally {new Uint8Array(plain).fill(0);plain=null;}
       if(manifest.format!==format || manifest.release!==config.release || !manifest.files)throw new Error('config');
-      const raw=bytes(manifest.dataKey);let key;
-      try {if(raw.length!==32)throw new Error('config');key=await crypto.subtle.importKey('raw',raw,{name:'AES-GCM'},false,['decrypt']);}
+      const raw=bytes(manifest.dataKey);let key,keyEnvelope;
+      try {
+        if(raw.length!==32)throw new Error('config');
+        key=await crypto.subtle.importKey('raw',raw,{name:'AES-GCM'},false,['decrypt']);
+        // Keep a small encrypted memory-only envelope for workers that cannot
+        // deserialize CryptoKey. The temporary bytes are transferred, never sent by fetch.
+        const envelopeKey=await crypto.subtle.generateKey({name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+        const iv=crypto.getRandomValues(new Uint8Array(12));
+        const cipher=await crypto.subtle.encrypt({name:'AES-GCM',iv,
+          additionalData:aad(`${format}\n${manifest.release}\nsession-key`)},envelopeKey,raw);
+        keyEnvelope={key:envelopeKey,iv,cipher};
+      }
       finally {raw.fill(0);delete manifest.dataKey;}
       input.value='';
       note('正在打开复盘…',true);
@@ -204,7 +236,7 @@
       const baseTag=documentCopy.createElement('base');baseTag.href=localURL('view/').href;
       documentCopy.head.prepend(baseTag);
       const badge=documentCopy.querySelector('.local-badge');if(badge)badge.textContent='比赛复盘';
-      active={key,manifest,issuedAt:Date.now(),html:'<!doctype html>\n'+documentCopy.documentElement.outerHTML};
+      active={key,keyEnvelope,manifest,issuedAt:Date.now(),html:'<!doctype html>\n'+documentCopy.documentElement.outerHTML};
       mountFrame();
     } catch(error) {
       if(current!==attempt)return;active=null;button.disabled=false;

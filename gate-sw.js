@@ -1,6 +1,7 @@
 /* Encrypted replay transport. No plaintext or key is written to persistent storage. */
 'use strict';
 const FORMAT = 'football-sealed-v1';
+const SHELL_VERSION = '20261020-mobile5';
 const SCOPE = new URL(self.registration.scope);
 const VIEW_PREFIX = `${SCOPE.pathname}view/`;
 const SESSION_MS = 12 * 60 * 60 * 1000;
@@ -8,6 +9,10 @@ const MAX_CHUNK_BYTES = 8 * 1024 * 1024;
 const sessions = new Map();
 const waiting = new Map();
 const pendingInstalls = new Set();
+const installStages = new Map();
+const CLIENT_LOOKUP_TIMEOUT_MS = 4000;
+const INSTALL_ERROR_CODES = new Set(['CLIENT_LOOKUP_TIMEOUT', 'CLIENT_UNAVAILABLE', 'INVALID_SESSION',
+  'SESSION_REVOKED', 'INVALID_KEY', 'KEY_IMPORT_FAILED', 'INVALID_MANIFEST', 'SESSION_LIMIT', 'INSTALL_FAILED']);
 let lastCleanup = 0;
 const encoder = new TextEncoder();
 
@@ -86,65 +91,140 @@ function revoke(clientId, reason = 'locked') {
   resolveWaiters(clientId, null);
   if (reason === 'expired') self.clients.get(clientId).then(client => client?.postMessage({type: 'REPLAY_SESSION_EXPIRED'}));
 }
+function sessionError(code) {
+  const error = new Error('Unable to establish replay session');
+  error.code = INSTALL_ERROR_CODES.has(code) ? code : 'INSTALL_FAILED';
+  return error;
+}
+function validRequestId(value) { return typeof value === 'string' && /^[0-9a-f]{32}$/.test(value); }
+function assertInstallActive(operation, issuedAt) {
+  if (operation.cancelled) throw sessionError('SESSION_REVOKED');
+  if (!integer(issuedAt) || issuedAt > Date.now() + 5000 || Date.now() - issuedAt >= SESSION_MS) {
+    throw sessionError('INVALID_SESSION');
+  }
+}
+function boundedClientLookup(clientId) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(sessionError('CLIENT_LOOKUP_TIMEOUT')), CLIENT_LOOKUP_TIMEOUT_MS);
+    Promise.resolve().then(() => self.clients.get(clientId)).then(client => {
+      clearTimeout(timer); resolve(client);
+    }, () => { clearTimeout(timer); reject(sessionError('CLIENT_UNAVAILABLE')); });
+  });
+}
+function rememberStage(clientId, stage) {
+  const now = Date.now();
+  for (const [id, value] of installStages) if (now - value.at >= 60000) installStages.delete(id);
+  installStages.delete(clientId);
+  if (installStages.size >= 128) installStages.delete(installStages.keys().next().value);
+  installStages.set(clientId, {stage, at: now});
+}
 async function cleanup() {
   if (Date.now() - lastCleanup < 60000) return;
   lastCleanup = Date.now();
-  for (const [id, session] of sessions) {
-    if (Date.now() >= session.expiresAt) revoke(id, 'expired');
-    else if (!await self.clients.get(id)) revoke(id);
-  }
+  // Stale-client housekeeping must never hold up this client's install or fetch.
+  // Lookup timeouts are inconclusive, so keep that session until a later cleanup.
+  await Promise.all([...sessions].map(async ([id, session]) => {
+    if (Date.now() >= session.expiresAt) { revoke(id, 'expired'); return; }
+    try {
+      const client = await boundedClientLookup(id);
+      if (!client && sessions.get(id) === session) revoke(id);
+    } catch (_) {}
+  }));
 }
 
+self.addEventListener('messageerror', event => {
+  // A transfer failure cannot grant authority or address any other native client.
+  if (!event.source?.id) return;
+  try { event.source.postMessage({type: 'REPLAY_TRANSFER_ERROR', code: 'KEY_TRANSFER_FAILED'}); } catch (_) {}
+});
 self.addEventListener('message', event => {
   const clientId = event.source?.id;
   const data = event.data;
   if (!clientId || !data || typeof data.type !== 'string') return;
-  // Invalidate older asynchronous installs immediately when a lock arrives.
-  // Otherwise an install waiting in clients.get() could recreate a revoked session.
-  if(data.type==='REPLAY_REVOKE_SESSION'){
-    for(const pending of pendingInstalls)if(pending.clientId===clientId)pending.cancelled=true;
-    revoke(clientId);
-  }
-  const operation = data.type==='REPLAY_INSTALL_SESSION' ? {clientId,cancelled:false} : null;
-  if(operation)pendingInstalls.add(operation);
   const reply = result => {
     // Both acknowledgements refer only to this message's native client.
     // No key, manifest or session authority is carried in either reply.
     try {event.ports?.[0]?.postMessage(result);} catch (_) {}
-    if(typeof data.requestId==='string' && /^[0-9a-f]{32}$/.test(data.requestId)){
+    if(validRequestId(data.requestId)){
       try {event.source.postMessage({type:'REPLAY_SESSION_REPLY',requestId:data.requestId,result});} catch (_) {}
     }
   };
+  // A ping is only a transport diagnostic, never evidence of an unlocked session.
+  if (data.type === 'REPLAY_PING') { reply({ok: true, version: SHELL_VERSION}); return; }
+  if (!['REPLAY_INSTALL_SESSION', 'REPLAY_REVOKE_SESSION'].includes(data.type)) return;
+  // Invalidate older asynchronous installs immediately when a lock arrives.
+  // Both client lookup and key import may yield before installation completes.
+  if (data.type === 'REPLAY_REVOKE_SESSION') {
+    for (const pending of pendingInstalls) if (pending.clientId === clientId) pending.cancelled = true;
+    installStages.delete(clientId);
+    revoke(clientId);
+    reply({ok: true});
+    return;
+  }
+  const operation = {clientId, cancelled: false};
+  pendingInstalls.add(operation);
+  const progress = stage => {
+    if (operation.cancelled) return;
+    rememberStage(clientId, stage);
+    if (validRequestId(data.requestId)) {
+      try { event.source.postMessage({type: 'REPLAY_SESSION_PROGRESS', requestId: data.requestId, stage}); } catch (_) {}
+    }
+  };
+  progress('received');
+  // Keep housekeeping alive independently without making INSTALL await it.
+  event.waitUntil(cleanup().catch(() => {}));
   event.waitUntil((async () => {
+    let keyBytes = null;
     try {
-      await cleanup();
-      if (data.type === 'REPLAY_REVOKE_SESSION') {
-        reply({ok: true});
-      } else if (data.type === 'REPLAY_INSTALL_SESSION') {
-        if (!await self.clients.get(clientId) || !validKey(data.key) ||
-            !integer(data.issuedAt) || data.issuedAt > Date.now() + 5000 || Date.now() - data.issuedAt >= SESSION_MS) throw new Error('Invalid session');
-        if(operation.cancelled)throw new Error('Session revoked during installation');
-        const existing = sessions.get(clientId);
-        // Concurrent cold-start resources can each request a key before the first reply arrives.
-        // Re-installing the same client generation must not abort that client's active streams.
-        if (isLive(existing) && existing.release === data.release && existing.issuedAt === data.issuedAt) {
-          resolveWaiters(clientId, existing);
-          reply({ok: true, expiresAt: existing.expiresAt});
-          return;
-        }
-        const files = validateManifest(data.manifest, data.release);
-        if (!sessions.has(clientId) && sessions.size >= 128) throw new Error('Too many open views');
-        if (sessions.has(clientId)) revoke(clientId);
-        const session = {key: data.key, files, release: data.release, issuedAt: data.issuedAt, expiresAt: data.issuedAt + SESSION_MS,
-          revoked: false, aborters: new Set()};
-        sessions.set(clientId, session);
-        resolveWaiters(clientId, session);
-        reply({ok: true, expiresAt: session.expiresAt});
+      if (data.keyBytes !== undefined) {
+        if (!(data.keyBytes instanceof ArrayBuffer)) throw sessionError('INVALID_KEY');
+        keyBytes = new Uint8Array(data.keyBytes);
+        if (keyBytes.byteLength !== 32) throw sessionError('INVALID_KEY');
       }
-    } catch (_) {
-      reply({ok: false, error: '无法建立解锁会话，请重新输入口令。'});
+      assertInstallActive(operation, data.issuedAt);
+      progress('client_lookup');
+      const client = await boundedClientLookup(clientId);
+      assertInstallActive(operation, data.issuedAt);
+      if (!client) throw sessionError('CLIENT_UNAVAILABLE');
+      let key = data.key;
+      if (keyBytes) {
+        assertInstallActive(operation, data.issuedAt);
+        progress('key_import');
+        try {
+          key = await crypto.subtle.importKey('raw', keyBytes, {name: 'AES-GCM'}, false, ['decrypt']);
+        } catch (_) { throw sessionError('KEY_IMPORT_FAILED'); }
+        assertInstallActive(operation, data.issuedAt);
+      }
+      if (!validKey(key)) throw sessionError('INVALID_KEY');
+      const existing = sessions.get(clientId);
+      // An idempotent install keeps the original expiry and active stream generation.
+      // Its transferred byte buffer is still erased by the common finally block.
+      if (isLive(existing) && existing.release === data.release && existing.issuedAt === data.issuedAt) {
+        assertInstallActive(operation, data.issuedAt);
+        resolveWaiters(clientId, existing);
+        progress('installed');
+        reply({ok: true, expiresAt: existing.expiresAt});
+        return;
+      }
+      let files;
+      try { files = validateManifest(data.manifest, data.release); }
+      catch (_) { throw sessionError('INVALID_MANIFEST'); }
+      if (!sessions.has(clientId) && sessions.size >= 128) throw sessionError('SESSION_LIMIT');
+      assertInstallActive(operation, data.issuedAt);
+      if (sessions.has(clientId)) revoke(clientId);
+      const session = {key, files, release: data.release, issuedAt: data.issuedAt, expiresAt: data.issuedAt + SESSION_MS,
+        revoked: false, aborters: new Set()};
+      assertInstallActive(operation, data.issuedAt);
+      sessions.set(clientId, session);
+      resolveWaiters(clientId, session);
+      progress('installed');
+      reply({ok: true, expiresAt: session.expiresAt});
+    } catch (error) {
+      const code = INSTALL_ERROR_CODES.has(error?.code) ? error.code : 'INSTALL_FAILED';
+      reply({ok: false, code, error: '无法建立解锁会话，请重新输入口令。'});
     } finally {
-      if(operation)pendingInstalls.delete(operation);
+      if (keyBytes) keyBytes.fill(0);
+      pendingInstalls.delete(operation);
     }
   })());
 });
@@ -332,7 +412,7 @@ function verifiedSizeStream(size) {
   });
 }
 async function protectedResponse(event, path) {
-  await cleanup();
+  event.waitUntil(cleanup().catch(() => {}));
   const session = await sessionFor(event.clientId);
   if (!isLive(session)) return errorResponse(401, '请在复盘入口输入口令后访问。');
   if (!['GET', 'HEAD'].includes(event.request.method)) return errorResponse(405, '不支持此请求。', {Allow: 'GET, HEAD'});
@@ -359,9 +439,31 @@ async function protectedResponse(event, path) {
   }
   return new Response(body, {status: range ? 206 : 200, headers: responseHeaders});
 }
+function sessionStatusResponse(event, url) {
+  const requestId = url.searchParams.get('requestId');
+  if (event.request.method !== 'GET') return errorResponse(405, '不支持此请求。', {Allow: 'GET'});
+  if (!validRequestId(requestId)) return new Response(JSON.stringify({ok: false, version: SHELL_VERSION}),
+    {status: 400, headers: headers('application/json; charset=utf-8')});
+  // This immediate read has no side effects: it neither requests a key nor grants
+  // access. FetchEvent.clientId must already own this exact live session.
+  const session = sessions.get(event.clientId);
+  const result = {ok: !!isLive(session), requestId, version: SHELL_VERSION};
+  if (result.ok) {
+    Object.assign(result, {release: session.release, issuedAt: session.issuedAt, expiresAt: session.expiresAt});
+  } else {
+    const recent = installStages.get(event.clientId);
+    if (recent && Date.now() - recent.at < 60000) result.stage = recent.stage;
+  }
+  return new Response(JSON.stringify(result), {status: result.ok ? 200 : 401,
+    headers: headers('application/json; charset=utf-8')});
+}
 self.addEventListener('fetch', event => {
   const url = new URL(event.request.url);
   if (url.origin !== SCOPE.origin || !url.pathname.startsWith(VIEW_PREFIX)) return;
+  if (url.pathname === `${VIEW_PREFIX}__session_status`) {
+    event.respondWith(sessionStatusResponse(event, url));
+    return;
+  }
   let path;
   try { path = decodeURIComponent(url.pathname.slice(VIEW_PREFIX.length)); }
   catch (_) { event.respondWith(errorResponse(404, '文件不存在。')); return; }
