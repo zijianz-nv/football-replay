@@ -179,7 +179,11 @@ async function readCipher(url, expected, signal) {
   const response = await fetch(url, {credentials: 'omit', redirect: 'error', signal});
   if (!response.ok || !response.body) throw new Error('Encrypted payload unavailable');
   const announced = response.headers.get('Content-Length');
-  if (announced && Number(announced) !== expected) throw new Error('Invalid encrypted length');
+  // CDNs may compress even ciphertext. Fetch decodes HTTP Content-Encoding,
+  // while Content-Length still describes the encoded wire body, not these bytes.
+  const contentEncoding = response.headers.get('Content-Encoding');
+  if ((!contentEncoding || contentEncoding.toLowerCase() === 'identity') &&
+      announced && Number(announced) !== expected) throw new Error('Invalid encrypted length');
   const reader = response.body.getReader();
   const bytes = new Uint8Array(expected);
   let offset = 0;
