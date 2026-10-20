@@ -1,7 +1,7 @@
 /* Encrypted replay transport. No plaintext or key is written to persistent storage. */
 'use strict';
 const FORMAT = 'football-sealed-v1';
-const SHELL_VERSION = '20261020-mobile5';
+const SHELL_VERSION = '20261020-mobile6';
 const SCOPE = new URL(self.registration.scope);
 const VIEW_PREFIX = `${SCOPE.pathname}view/`;
 const SESSION_MS = 12 * 60 * 60 * 1000;

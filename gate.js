@@ -7,7 +7,13 @@
   const loadNotice = document.querySelector('#load-notice');
   let active = null, iframe = null, attempt = 0;
   let restoreTimer = null, entryTimer = null, viewReady = false;
-  const shellVersion = '20261020-mobile5';
+  let startupFailed = false, startupStep = 0, noticeKind = null;
+  const shellVersion = '20261020-mobile6';
+  const scriptLabels = {
+    'data.js':'比赛数据', 'ball-visibility.js':'球的位置',
+    'person-continuity.js':'球员轨迹', 'team-statistics.js':'技术统计',
+    'player-details.js':'球员资料', 'app.js':'复盘界面', 'mobile-layout.js':'手机布局'
+  };
   const closingFrames = new Map();
   const bytes = value => Uint8Array.from(atob(value), c => c.charCodeAt(0));
   const aad = text => new TextEncoder().encode(text);
@@ -23,21 +29,34 @@
     SESSION_INVALID:'解锁会话校验失败，请重新输入口令。（S04）',
     CONTENT_INVALID:'复盘文件校验失败，请刷新页面重试。（D01）'
   }[code] || '内容暂时无法载入，请刷新页面重试。（U01）');
-  function showLoadNotice(text) {
+  function showLoadNotice(text, kind = 'progress') {
+    noticeKind=kind;
     if (!loadNotice) return;
     loadNotice.querySelector('span').textContent = text;
     loadNotice.hidden = false;
   }
   const phaseText = code => ({
-    controller:'正在连接解锁服务…（M5-C）',
-    received:'解锁请求已收到，正在建立会话…（M5-I）',
-    client_lookup:'正在确认当前页面…（M5-L）',
-    key_import:'正在处理兼容连接…（M5-K）',
-    installed:'连接已建立，正在加载复盘…（M5-R）',
-    status_check:'正在核验连接状态…（M5-P）',
-    byte_retry:'正在尝试兼容连接…（M5-B）',
-    render:'连接已建立，正在加载复盘…（M5-R）'
+    controller:'正在连接解锁服务…（M6-C）',
+    received:'解锁请求已收到，正在建立会话…（M6-I）',
+    client_lookup:'正在确认当前页面…（M6-L）',
+    key_import:'正在处理兼容连接…（M6-K）',
+    installed:'连接已建立，正在准备比赛数据…（M6-R）',
+    status_check:'正在核验连接状态…（M6-P）',
+    byte_retry:'正在尝试兼容连接…（M6-B）',
+    render:'连接已建立，正在准备比赛数据…（M6-R）'
   }[code] || '正在打开复盘…');
+  function hideLoadNotice() {
+    noticeKind=null;
+    if(loadNotice)loadNotice.hidden=true;
+  }
+  function watchStartup(text, delay = 45000) {
+    clearTimeout(entryTimer);
+    const frame=iframe;
+    entryTimer=setTimeout(()=>{
+      entryTimer=null;
+      if(iframe===frame && !viewReady && !startupFailed && noticeKind!=='error')showLoadNotice(text);
+    },delay);
+  }
   async function fetchBytes(path, code, limit) {
     // Retry transport failures only. A failed authentication is never retried as a network error.
     for (let trial=0;trial<3;trial++) {
@@ -108,7 +127,7 @@
     closingFrames.delete(frame);frame.remove();
   }
   function retireFrame() {
-    viewReady=false;
+    viewReady=false;startupFailed=false;startupStep=0;noticeKind=null;
     clearInterval(restoreTimer);restoreTimer=null;
     clearTimeout(entryTimer);entryTimer=null;
     const closing=iframe;iframe=null;
@@ -133,9 +152,7 @@
     document.querySelector('#frame-host').append(frame);
     gate.hidden=true;viewer.hidden=false;button.disabled=false;
     showLoadNotice(phaseText('controller'));
-    entryTimer=setTimeout(()=>{
-      if(iframe===frame)showLoadNotice('复盘仍在加载，可点击重试，无需重复输入口令。（S03-W）');
-    },35000);
+    watchStartup('复盘仍在加载，可点击重试，无需重复输入口令。（S03-W）',35000);
     if(restore && Number.isFinite(restore.time)) {
       const deadline=Date.now()+120000;
       restoreTimer=setInterval(()=>{
@@ -151,7 +168,7 @@
   }
   function lock(text='已退出复盘。') {
     attempt++;retireFrame();active=null;
-    if(loadNotice)loadNotice.hidden=true;
+    hideLoadNotice();
     input.value='';button.disabled=false;viewer.hidden=true;gate.hidden=false;note(text);input.focus();
   }
   window.addEventListener('message',event=>{
@@ -165,32 +182,72 @@
     if(event.data?.type==='REPLAY_BRIDGE_READY' && active) {
       if(event.data.version!==shellVersion){
         clearTimeout(entryTimer);entryTimer=null;
-        showLoadNotice('页面版本未更新，请刷新后重新打开。（S05）');return;
+        startupFailed=true;
+        showLoadNotice('页面版本未更新，请刷新后重新打开。（S05）','error');return;
       }
       iframe.contentWindow.postMessage({type:'REPLAY_UNLOCK',key:active.key,keyEnvelope:active.keyEnvelope,manifest:active.manifest,
         release:active.manifest.release,issuedAt:active.issuedAt,html:active.html},location.origin);
     } else if(event.data?.type==='REPLAY_LOCKED') lock('访问已结束，请重新输入口令。');
-    else if(event.data?.type==='REPLAY_VIEW_READY') {viewReady=true;clearTimeout(entryTimer);entryTimer=null;if(loadNotice)loadNotice.hidden=true;}
+    else if(event.data?.type==='REPLAY_VIEW_READY') {
+      if(startupFailed)return;
+      viewReady=true;clearTimeout(entryTimer);entryTimer=null;
+      if(noticeKind!=='error')hideLoadNotice();
+    }
     else if(event.data?.type==='REPLAY_UNLOCKED') {
-      clearTimeout(entryTimer);
-      entryTimer=null;
+      if(startupFailed)return;
       // Reconnecting an already-rendered view does not require a second render.
-      if(viewReady){if(loadNotice)loadNotice.hidden=true;}
-      else {
+      if(viewReady){
+        clearTimeout(entryTimer);entryTimer=null;
+        if(noticeKind!=='error')hideLoadNotice();
+      } else if(!startupStep && noticeKind!=='error') {
         showLoadNotice(phaseText('render'));
-        entryTimer=setTimeout(()=>showLoadNotice('连接已建立，但复盘内容仍未载入，可重试加载。（N05）'),30000);
+        watchStartup('连接已建立，但复盘尚未启动，可重试加载，无需重复输入口令。（N05）',30000);
       }
     }
-    else if(event.data?.type==='REPLAY_PHASE') showLoadNotice(phaseText(event.data.code));
-    else if(event.data?.type==='REPLAY_RESOURCE_ERROR') showLoadNotice('部分内容加载失败，可重试并回到当前播放位置。（N04）');
+    else if(event.data?.type==='REPLAY_LOAD_PROGRESS') {
+      if(viewReady || startupFailed)return;
+      const {index,total,resource,stage,received,totalBytes}=event.data;
+      if(!Object.hasOwn(scriptLabels,resource) || !Number.isSafeInteger(index) ||
+          !Number.isSafeInteger(total) || index<1 || total>32 || index>total ||
+          index<startupStep || !['fetch','execute','complete'].includes(stage) ||
+          !Number.isSafeInteger(totalBytes) || totalBytes<=0 || totalBytes>32*1024*1024 ||
+          !Number.isSafeInteger(received) || received<0 || received>totalBytes)return;
+      startupStep=index;
+      const label=scriptLabels[resource];
+      const action=stage==='fetch'?'正在读取':stage==='execute'?'正在初始化':'已准备';
+      const percent=stage==='fetch' && received?` ${Math.floor(received/totalBytes*100)}%`:'';
+      showLoadNotice(`${action}${label}${percent}（${index}/${total}）…`);
+      watchStartup(`${label}仍在加载，可点击重试，无需重复输入口令。（M6-W${index}）`);
+    }
+    else if(event.data?.type==='REPLAY_STARTUP_ERROR') {
+      if(viewReady || startupFailed)return;
+      startupFailed=true;clearTimeout(entryTimer);entryTimer=null;
+      const {code,resource,index}=event.data;
+      const label=Object.hasOwn(scriptLabels,resource)?scriptLabels[resource]:'复盘内容';
+      const reason=({LOAD_TIMEOUT:'读取超时',LOAD_FAILED:'读取失败',
+        SCRIPT_EXECUTION:'启动失败',APP_INIT_FAILED:'未能完成初始化'})[code]||'加载失败';
+      const suffix=({LOAD_TIMEOUT:'T',LOAD_FAILED:'F',SCRIPT_EXECUTION:'J',APP_INIT_FAILED:'I'})[code]||'F';
+      const step=Number.isSafeInteger(index)&&index>=0&&index<=32?index:0;
+      showLoadNotice(`${label}${reason}，点击重试加载，无需重复输入口令。（M6-${suffix}${step}）`,'error');
+    }
+    else if(event.data?.type==='REPLAY_PHASE') {
+      if(!viewReady && !startupFailed && !startupStep && noticeKind!=='error')showLoadNotice(phaseText(event.data.code));
+    }
+    else if(event.data?.type==='REPLAY_RESOURCE_ERROR') {
+      // Startup reads own their bounded retries and precise failure messages.
+      if(viewReady)showLoadNotice('部分内容加载失败，可重试并回到当前播放位置。（N04）','error');
+    }
     else if(event.data?.type==='REPLAY_RECONNECTING') {
+      if(startupFailed || noticeKind==='error' || (!viewReady && startupStep))return;
       clearTimeout(entryTimer);entryTimer=null;
-      showLoadNotice(phaseText(event.data.code==='KEY_TRANSFER_FAILED' || event.data.code==='SESSION_TIMEOUT'?'byte_retry':'controller'));
+      showLoadNotice(phaseText(event.data.code==='KEY_TRANSFER_FAILED' || event.data.code==='SESSION_TIMEOUT'?'byte_retry':'controller'),'reconnecting');
     }
     else if(event.data?.type==='REPLAY_RETRYABLE_ERROR') {
+      if(startupFailed)return;
       clearTimeout(entryTimer);entryTimer=null;
+      if(!viewReady)startupFailed=true;
       const code=({SESSION_TIMEOUT:'S03-A',KEY_TRANSFER_FAILED:'S03-K',CLIENT_LOOKUP_TIMEOUT:'S03-L',CLIENT_UNAVAILABLE:'S03-L'})[event.data.code]||'S03-C';
-      showLoadNotice(`解锁连接暂时中断，点击重试加载，无需重复输入口令。（${code}）`);
+      showLoadNotice(`解锁连接暂时中断，点击重试加载，无需重复输入口令。（${code}）`,'error');
     }
     else if(event.data?.type==='REPLAY_ERROR') lock(errorText(event.data.code));
   });
