@@ -7,6 +7,7 @@ const SESSION_MS = 12 * 60 * 60 * 1000;
 const MAX_CHUNK_BYTES = 8 * 1024 * 1024;
 const sessions = new Map();
 const waiting = new Map();
+const pendingInstalls = new Set();
 let lastCleanup = 0;
 const encoder = new TextEncoder();
 
@@ -98,16 +99,31 @@ self.addEventListener('message', event => {
   const clientId = event.source?.id;
   const data = event.data;
   if (!clientId || !data || typeof data.type !== 'string') return;
-  const reply = result => event.ports?.[0]?.postMessage(result);
+  // Invalidate older asynchronous installs immediately when a lock arrives.
+  // Otherwise an install waiting in clients.get() could recreate a revoked session.
+  if(data.type==='REPLAY_REVOKE_SESSION'){
+    for(const pending of pendingInstalls)if(pending.clientId===clientId)pending.cancelled=true;
+    revoke(clientId);
+  }
+  const operation = data.type==='REPLAY_INSTALL_SESSION' ? {clientId,cancelled:false} : null;
+  if(operation)pendingInstalls.add(operation);
+  const reply = result => {
+    // Both acknowledgements refer only to this message's native client.
+    // No key, manifest or session authority is carried in either reply.
+    try {event.ports?.[0]?.postMessage(result);} catch (_) {}
+    if(typeof data.requestId==='string' && /^[0-9a-f]{32}$/.test(data.requestId)){
+      try {event.source.postMessage({type:'REPLAY_SESSION_REPLY',requestId:data.requestId,result});} catch (_) {}
+    }
+  };
   event.waitUntil((async () => {
     try {
       await cleanup();
       if (data.type === 'REPLAY_REVOKE_SESSION') {
-        revoke(clientId);
         reply({ok: true});
       } else if (data.type === 'REPLAY_INSTALL_SESSION') {
         if (!await self.clients.get(clientId) || !validKey(data.key) ||
             !integer(data.issuedAt) || data.issuedAt > Date.now() + 5000 || Date.now() - data.issuedAt >= SESSION_MS) throw new Error('Invalid session');
+        if(operation.cancelled)throw new Error('Session revoked during installation');
         const existing = sessions.get(clientId);
         // Concurrent cold-start resources can each request a key before the first reply arrives.
         // Re-installing the same client generation must not abort that client's active streams.
@@ -127,6 +143,8 @@ self.addEventListener('message', event => {
       }
     } catch (_) {
       reply({ok: false, error: '无法建立解锁会话，请重新输入口令。'});
+    } finally {
+      if(operation)pendingInstalls.delete(operation);
     }
   })());
 });

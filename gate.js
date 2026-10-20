@@ -7,7 +7,7 @@
   const loadNotice = document.querySelector('#load-notice');
   let active = null, iframe = null, attempt = 0;
   let restoreTimer = null, entryTimer = null;
-  const shellVersion = '20261020-mobile3';
+  const shellVersion = '20261020-mobile4';
   const closingFrames = new Map();
   const bytes = value => Uint8Array.from(atob(value), c => c.charCodeAt(0));
   const aad = text => new TextEncoder().encode(text);
@@ -123,7 +123,7 @@
     gate.hidden=true;viewer.hidden=false;button.disabled=false;
     if(loadNotice)loadNotice.hidden=true;
     entryTimer=setTimeout(()=>{
-      if(iframe===frame)showLoadNotice('复盘仍在连接，网络较慢时可点击重试，无需重复输入口令。（S03）');
+      if(iframe===frame)showLoadNotice('复盘仍在加载，可点击重试，无需重复输入口令。（S03-W）');
     },35000);
     if(restore && Number.isFinite(restore.time)) {
       const deadline=Date.now()+120000;
@@ -152,14 +152,23 @@
     }
     if(!iframe || event.source!==iframe.contentWindow)return;
     if(event.data?.type==='REPLAY_BRIDGE_READY' && active) {
+      if(event.data.version!==shellVersion){
+        clearTimeout(entryTimer);entryTimer=null;
+        showLoadNotice('页面版本未更新，请刷新后重新打开。（S05）');return;
+      }
       iframe.contentWindow.postMessage({type:'REPLAY_UNLOCK',key:active.key,manifest:active.manifest,
         release:active.manifest.release,issuedAt:active.issuedAt,html:active.html},location.origin);
     } else if(event.data?.type==='REPLAY_LOCKED') lock('访问已结束，请重新输入口令。');
     else if(event.data?.type==='REPLAY_VIEW_READY') {clearTimeout(entryTimer);entryTimer=null;if(loadNotice)loadNotice.hidden=true;}
     else if(event.data?.type==='REPLAY_RESOURCE_ERROR') showLoadNotice('部分内容加载失败，可重试并回到当前播放位置。（N04）');
+    else if(event.data?.type==='REPLAY_RECONNECTING') {
+      clearTimeout(entryTimer);entryTimer=null;
+      showLoadNotice('正在重新连接解锁服务，请稍候…');
+    }
     else if(event.data?.type==='REPLAY_RETRYABLE_ERROR') {
       clearTimeout(entryTimer);entryTimer=null;
-      showLoadNotice('解锁连接暂时中断，点击重试加载，无需重复输入口令。（S03）');
+      const code=event.data.code==='SESSION_TIMEOUT'?'S03-A':'S03-C';
+      showLoadNotice(`解锁连接暂时中断，点击重试加载，无需重复输入口令。（${code}）`);
     }
     else if(event.data?.type==='REPLAY_ERROR') lock(errorText(event.data.code));
   });
