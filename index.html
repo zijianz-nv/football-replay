@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#101820">
+  <meta name="referrer" content="no-referrer">
+  <title>比赛复盘 · 访问验证</title>
+  <link rel="stylesheet" href="gate.css">
+  <script src="gate.js" defer></script>
+</head>
+<body>
+  <main class="gate" id="gate">
+    <section class="gate-card" aria-labelledby="gate-title">
+      <div class="pitch-mark" aria-hidden="true"><span></span></div>
+      <p class="eyebrow">MATCH REVIEW</p>
+      <h1 id="gate-title">比赛复盘</h1>
+      <p class="intro">输入访问口令，查看完整比赛与复盘。</p>
+      <form id="unlock-form">
+        <label for="password">访问口令</label>
+        <div class="password-field"><input id="password" name="password" type="password" autocomplete="current-password" required autofocus maxlength="256"><button id="show-password" type="button" aria-label="显示口令" aria-pressed="false">显示</button></div>
+        <p id="gate-message" class="message" role="status" aria-live="polite"></p>
+        <button id="unlock" class="primary" type="submit">进入复盘 <span aria-hidden="true">→</span></button>
+      </form>
+      <p class="footnote">刷新或退出后，需要重新输入口令。</p>
+    </section>
+  </main>
+  <section id="viewer" hidden aria-label="比赛复盘">
+    <div class="viewer-bar"><span><i></i> 比赛复盘</span><button id="lock" type="button">退出复盘</button></div>
+    <div id="frame-host"></div>
+  </section>
+  <noscript>请启用 JavaScript 后输入口令。</noscript>
+</body>
+</html>
