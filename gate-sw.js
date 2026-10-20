@@ -175,28 +175,67 @@ function parseRange(value, size) {
   }
   return {start, end};
 }
-async function readCipher(url, expected, signal) {
-  const response = await fetch(url, {credentials: 'omit', redirect: 'error', signal});
-  if (!response.ok || !response.body) throw new Error('Encrypted payload unavailable');
-  const announced = response.headers.get('Content-Length');
-  // CDNs may compress even ciphertext. Fetch decodes HTTP Content-Encoding,
-  // while Content-Length still describes the encoded wire body, not these bytes.
-  const contentEncoding = response.headers.get('Content-Encoding');
-  if ((!contentEncoding || contentEncoding.toLowerCase() === 'identity') &&
-      announced && Number(announced) !== expected) throw new Error('Invalid encrypted length');
-  const reader = response.body.getReader();
-  const bytes = new Uint8Array(expected);
-  let offset = 0;
+function resourceError() {
+  const error = new Error('Encrypted resource unavailable');
+  error.code = 'RESOURCE_UNAVAILABLE';
+  return error;
+}
+async function readCipherOnce(url, expected, signal, retry) {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  let timer, reader;
+  const progress = () => {
+    clearTimeout(timer);
+    // A slow connection is allowed to keep making progress; only a stalled read times out.
+    timer = setTimeout(abort, 30000);
+  };
+  if (signal.aborted) abort();
+  signal.addEventListener('abort', abort, {once: true});
   try {
+    progress();
+    const response = await fetch(url, {credentials: 'omit', redirect: 'error',
+      cache: retry ? 'reload' : 'default', signal: controller.signal});
+    if (!response.ok || !response.body) throw resourceError();
+    // Fetch exposes decoded bytes. Content-Length may describe the CDN's gzip
+    // transport instead, so validate the actual bounded body and the GCM tag.
+    reader = response.body.getReader();
+    const bytes = new Uint8Array(expected);
+    let offset = 0;
     while (true) {
+      progress();
       const {done, value} = await reader.read();
       if (done) break;
-      if (offset + value.byteLength > expected) throw new Error('Oversized payload');
+      if (offset + value.byteLength > expected) throw resourceError();
       bytes.set(value, offset); offset += value.byteLength;
     }
-    if (offset !== expected) throw new Error('Truncated payload');
+    if (offset !== expected) throw resourceError();
     return bytes;
-  } finally { await reader.cancel().catch(() => {}); }
+  } catch (_) {
+    throw resourceError();
+  } finally {
+    clearTimeout(timer);
+    signal.removeEventListener('abort', abort);
+    if (reader) await reader.cancel().catch(() => {});
+    controller.abort();
+  }
+}
+function retryDelay(ms, signal) {
+  return new Promise(resolve => {
+    const finish = () => { clearTimeout(timer); signal.removeEventListener('abort', finish); resolve(); };
+    const timer = setTimeout(finish, ms);
+    signal.addEventListener('abort', finish, {once: true});
+    if (signal.aborted) finish();
+  });
+}
+async function readCipher(url, expected, signal) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (signal.aborted) throw resourceError();
+    try { return await readCipherOnce(url, expected, signal, attempt > 0); }
+    catch (error) {
+      if (signal.aborted || attempt === 2) throw error;
+      await retryDelay(attempt ? 1200 : 400, signal);
+    }
+  }
 }
 function encryptedStream(session, clientId, path, file, start, end) {
   const aborter = new AbortController();
@@ -221,11 +260,13 @@ function encryptedStream(session, clientId, path, file, start, end) {
         const to = Math.min(chunk.length, end - chunk.offset + 1);
         index++;
         controller.enqueue(plain.subarray(from, to));
-      } catch (_) {
+      } catch (error) {
         const expectedCancellation = cancelled || aborter.signal.aborted || !isLive(session);
         finish(); aborter.abort();
         if (!cancelled) controller.error(new Error(expectedCancellation ? '访问会话已结束。' : '无法解密复盘文件，请刷新后重试。'));
-        if (!expectedCancellation) self.clients.get(clientId).then(client => client?.postMessage({type: 'REPLAY_CONTENT_ERROR'}));
+        if (!expectedCancellation) self.clients.get(clientId).then(client => client?.postMessage({
+          type: error.code === 'RESOURCE_UNAVAILABLE' ? 'REPLAY_RESOURCE_ERROR' : 'REPLAY_CONTENT_ERROR'
+        }));
         else if (Date.now() >= session.expiresAt && sessions.get(clientId) === session) revoke(clientId, 'expired');
       }
     },

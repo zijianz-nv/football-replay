@@ -6,8 +6,8 @@
   <meta name="theme-color" content="#101820">
   <meta name="referrer" content="no-referrer">
   <title>比赛复盘 · 访问验证</title>
-  <link rel="stylesheet" href="gate.css">
-  <script src="gate.js" defer></script>
+  <link rel="stylesheet" href="gate.css?v=20261020-mobile2">
+  <script src="gate.js?v=20261020-mobile2" defer></script>
 </head>
 <body>
   <main class="gate" id="gate">
@@ -27,6 +27,11 @@
   </main>
   <section id="viewer" hidden aria-label="比赛复盘">
     <div class="viewer-bar"><span><i></i> 比赛复盘</span><button id="lock" type="button">退出复盘</button></div>
+    <div id="load-notice" class="load-notice" hidden role="status">
+      <span>部分内容加载失败，可重试并回到当前播放位置。</span>
+      <button id="retry-content" type="button">重试加载</button>
+      <button id="dismiss-content" type="button" aria-label="关闭加载提示">×</button>
+    </div>
     <div id="frame-host"></div>
   </section>
   <noscript>请启用 JavaScript 后输入口令。</noscript>

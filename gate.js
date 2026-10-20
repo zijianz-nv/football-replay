@@ -4,7 +4,9 @@
   const form = document.querySelector('#unlock-form'), input = document.querySelector('#password');
   const message = document.querySelector('#gate-message'), button = document.querySelector('#unlock');
   const gate = document.querySelector('#gate'), viewer = document.querySelector('#viewer');
+  const loadNotice = document.querySelector('#load-notice');
   let active = null, iframe = null, attempt = 0;
+  let restoreTimer = null;
   const closingFrames = new Map();
   const bytes = value => Uint8Array.from(atob(value), c => c.charCodeAt(0));
   const aad = text => new TextEncoder().encode(text);
@@ -45,9 +47,9 @@
     const timer=closingFrames.get(frame);if(timer)clearTimeout(timer);
     closingFrames.delete(frame);frame.remove();
   }
-  function lock(text='已退出复盘。') {
-    attempt++;
-    const closing=iframe;iframe=null;active=null;
+  function retireFrame() {
+    clearInterval(restoreTimer);restoreTimer=null;
+    const closing=iframe;iframe=null;
     if(closing) {
       // Stop playback immediately, while giving the bridge time to revoke its native client session.
       for(const video of closing.contentDocument?.querySelectorAll('video')||[]) {
@@ -56,6 +58,34 @@
       closingFrames.set(closing,setTimeout(()=>closeFrame(closing),500));
       closing.contentWindow?.postMessage({type:'REPLAY_LOCK'},location.origin);
     }
+  }
+  function mountFrame(restore = null) {
+    if(!active)return;
+    retireFrame();
+    const frame=document.createElement('iframe');iframe=frame;
+    frame.title='完整比赛复盘';frame.allow='fullscreen';frame.referrerPolicy='no-referrer';
+    // A real document URL gives WebKit its own native service-worker client.
+    // srcdoc can incorrectly send its install message using the parent's client ID.
+    frame.src=localURL('gate-frame.html').href;
+    document.querySelector('#frame-host').append(frame);
+    gate.hidden=true;viewer.hidden=false;button.disabled=false;
+    if(loadNotice)loadNotice.hidden=true;
+    if(restore && Number.isFinite(restore.time)) {
+      const deadline=Date.now()+120000;
+      restoreTimer=setInterval(()=>{
+        if(iframe!==frame || Date.now()>deadline){clearInterval(restoreTimer);restoreTimer=null;return;}
+        const app=frame.contentWindow?.matchReview,video=frame.contentDocument?.querySelector('video');
+        if(!app?.getState().mediaReady || !video)return;
+        clearInterval(restoreTimer);restoreTimer=null;
+        app.seekTo(restore.time);
+        video.playbackRate=restore.rate;video.muted=restore.muted;video.volume=restore.volume;
+        if(!restore.paused)video.play().catch(()=>{});
+      },200);
+    }
+  }
+  function lock(text='已退出复盘。') {
+    attempt++;retireFrame();active=null;
+    if(loadNotice)loadNotice.hidden=true;
     input.value='';button.disabled=false;viewer.hidden=true;gate.hidden=false;note(text);input.focus();
   }
   window.addEventListener('message',event=>{
@@ -67,8 +97,10 @@
     }
     if(!iframe || event.source!==iframe.contentWindow)return;
     if(event.data?.type==='REPLAY_BRIDGE_READY' && active) {
-      iframe.contentWindow.postMessage({type:'REPLAY_UNLOCK',key:active.key,manifest:active.manifest,release:active.manifest.release},location.origin);
+      iframe.contentWindow.postMessage({type:'REPLAY_UNLOCK',key:active.key,manifest:active.manifest,
+        release:active.manifest.release,issuedAt:active.issuedAt,html:active.html},location.origin);
     } else if(event.data?.type==='REPLAY_LOCKED') lock('访问已结束，请重新输入口令。');
+    else if(event.data?.type==='REPLAY_RESOURCE_ERROR') {if(loadNotice)loadNotice.hidden=false;}
     else if(event.data?.type==='REPLAY_ERROR') lock('内容暂时无法载入，请重新解锁。');
   });
   form.addEventListener('submit',async event=>{
@@ -97,23 +129,29 @@
       const documentCopy=new DOMParser().parseFromString(html,'text/html');
       if(documentCopy.querySelector('base'))throw new Error('config');
       const baseTag=documentCopy.createElement('base');baseTag.href=localURL('view/').href;
-      const bridge=documentCopy.createElement('script');bridge.src=localURL('gate-bridge.js').href;
-      documentCopy.head.prepend(baseTag,bridge);
+      documentCopy.head.prepend(baseTag);
       const badge=documentCopy.querySelector('.local-badge');if(badge)badge.textContent='比赛复盘';
-      active={key,manifest};iframe=document.createElement('iframe');iframe.title='完整比赛复盘';iframe.allow='fullscreen';iframe.referrerPolicy='no-referrer';
-      iframe.srcdoc='<!doctype html>\n'+documentCopy.documentElement.outerHTML;
-      document.querySelector('#frame-host').append(iframe);gate.hidden=true;viewer.hidden=false;button.disabled=false;
+      active={key,manifest,issuedAt:Date.now(),html:'<!doctype html>\n'+documentCopy.documentElement.outerHTML};
+      mountFrame();
     } catch(error) {
       if(current!==attempt)return;active=null;button.disabled=false;
       note(error.message==='password'?'口令不正确，请重试。':error.message==='unsupported'?'请使用较新版本的 Safari、Chrome 或 Edge 打开。':'内容暂时无法载入，请稍后重试。');
     }
   });
   document.querySelector('#lock').addEventListener('click',()=>lock());
+  document.querySelector('#retry-content')?.addEventListener('click',()=>{
+    if(!active || !iframe)return;
+    const app=iframe.contentWindow?.matchReview,video=iframe.contentDocument?.querySelector('video');
+    const restore=app&&video?{time:app.getState().sourceTime,paused:video.paused,
+      rate:video.playbackRate,muted:video.muted,volume:video.volume}:null;
+    mountFrame(restore);
+  });
+  document.querySelector('#dismiss-content')?.addEventListener('click',()=>{loadNotice.hidden=true;});
   document.querySelector('#show-password').addEventListener('click',event=>{
     const show=input.type==='password';input.type=show?'text':'password';event.currentTarget.textContent=show?'隐藏':'显示';event.currentTarget.setAttribute('aria-pressed',String(show));
   });
   window.addEventListener('pagehide',()=>{
-    attempt++;button.disabled=false;active=null;
+    attempt++;button.disabled=false;active=null;clearInterval(restoreTimer);restoreTimer=null;
     if(iframe){iframe.contentWindow?.postMessage({type:'REPLAY_LOCK'},location.origin);iframe.remove();iframe=null;}
     for(const frame of closingFrames.keys())closeFrame(frame);
     input.value='';viewer.hidden=true;gate.hidden=false;
